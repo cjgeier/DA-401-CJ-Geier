@@ -1,13 +1,13 @@
 # DA401 Capstone Project - CJ Geier
 
 ## Project Title
-(Write a clear, descriptive title for your project.)
+Evaluating the Effect of Play Action on Defensive Disruption and Offensive Efficiency
 
 ## Research Question
 What question are you trying to answer?
 
 ## Data Source
-Where is your data coming from? 
+NFL Big Data Bowl 2024
 
 ## Methods
 Which methods or models will you use? 
