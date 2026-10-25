@@ -1,0 +1,803 @@
+---
+title: "Data exploration"
+output: html_document
+date: "2026-10-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Goal for this is to perform a lot of data exploratnion, get a feel for the data and find some early results visuals
+
+
+```{r}
+library(tidyverse)
+```
+
+
+
+
+```{r}
+
+## was being weird so i had to add the weird subfolder thing first
+
+plays       <- read.csv("big-data-bowl-data/plays.csv")
+player_play <- read.csv("big-data-bowl-data/player_play.csv")
+players     <- read.csv("big-data-bowl-data/players.csv")
+games       <- read.csv("big-data-bowl-data/games.csv")
+
+
+```
+
+```{r}
+## Add the score differential
+plays <- plays %>%
+  left_join(games %>% select(gameId, homeTeamAbbr), by = "gameId") %>%
+  mutate(score_diff = ifelse(possessionTeam == homeTeamAbbr,
+                             preSnapHomeScore - preSnapVisitorScore,
+                             preSnapVisitorScore - preSnapHomeScore))
+```
+
+```{r}
+## Filter to dropbacks on just the downs 1-3, with 10 yards or less, and no garbage time
+pass_plays <- plays %>%
+  filter(isDropback == TRUE,
+         down %in% c(1, 2, 3),
+         yardsToGo <= 10,
+         qbSpike == FALSE,
+         playNullifiedByPenalty == "N",
+         quarter <= 4,
+         !(quarter == 4 & abs(score_diff) > 16))
+
+nrow(pass_plays)
+```
+
+
+```{r}
+## Average get off and time to pressure for the pass rushers on each play
+
+
+rusher_stats <- player_play %>%
+  filter(wasInitialPassRusher == 1) %>%
+  group_by(gameId, playId) %>%
+  summarize(n_rushers = n(),
+            avg_getoff = mean(getOffTimeAsPassRusher, na.rm = TRUE),
+            avg_time_to_pressure = mean(timeToPressureAsPassRusher, na.rm = TRUE),
+            .groups = "drop")
+
+
+model_data <- pass_plays %>%
+  left_join(rusher_stats, by = c("gameId", "playId"))
+
+dim(model_data)
+
+```
+
+
+```{r}
+## First comparison is play-action vs regular dropbacks
+
+model_data %>%
+  group_by(playAction) %>%
+  summarize(n = n(),
+            mean_epa = mean(expectedPointsAdded, na.rm = TRUE),
+            mean_getoff = mean(avg_getoff, na.rm = TRUE),
+            mean_rushers = mean(n_rushers, na.rm = TRUE),
+            missing_getoff = sum(is.nan(avg_getoff) | is.na(avg_getoff)))
+```
+
+
+```{r}
+
+## Regressions controlling for down, distance, field position, and score
+epa_model <- lm(expectedPointsAdded ~ playAction + factor(down) + yardsToGo +
+                  absoluteYardlineNumber + score_diff,
+                data = model_data)
+summary(epa_model)
+
+getoff_model <- lm(avg_getoff ~ playAction + factor(down) + yardsToGo +
+                     absoluteYardlineNumber + score_diff,
+                   data = model_data)
+summary(getoff_model)
+
+```
+
+
+```{r}
+## Control for the number of rushers
+getoff_model2 <- lm(avg_getoff ~ playAction + n_rushers + factor(down) + yardsToGo +
+                      absoluteYardlineNumber + score_diff,
+                    data = model_data)
+summary(getoff_model2)
+```
+
+
+```{r}
+## Get off for defensive linemen only
+dl_stats <- player_play %>%
+  left_join(players %>% select(nflId, position), by = "nflId") %>%
+  filter(wasInitialPassRusher == 1, position %in% c("DE", "DT", "NT")) %>%
+  group_by(gameId, playId) %>%
+  summarize(dl_getoff = mean(getOffTimeAsPassRusher, na.rm = TRUE), .groups = "drop")
+
+model_data <- model_data %>%
+  left_join(dl_stats, by = c("gameId", "playId"))
+
+dl_model <- lm(dl_getoff ~ playAction + factor(down) + yardsToGo +
+                 absoluteYardlineNumber + score_diff,
+               data = model_data)
+summary(dl_model)
+```
+
+```{r}
+
+## Confidence interval for the EPA effect
+confint(epa_model)["playActionTRUE", ]
+
+
+## Other outcomes by play type
+model_data %>%
+  group_by(playAction) %>%
+  summarize(n = n(),
+            mean_yards = mean(yardsGained, na.rm = TRUE),
+            sack_rate = mean(passResult == "S", na.rm = TRUE),
+            int_rate = mean(passResult == "IN", na.rm = TRUE),
+            mean_epa = mean(expectedPointsAdded, na.rm = TRUE))
+
+```
+
+
+```{r}
+
+## Does slower get off go with higher EPA?
+link_model <- lm(expectedPointsAdded ~ avg_getoff + playAction + factor(down) + yardsToGo +
+                   absoluteYardlineNumber + score_diff,
+                 data = model_data)
+summary(link_model)
+
+```
+
+```{r}
+
+
+## Yards per dropback with the same controls
+yards_model <- lm(yardsGained ~ playAction + factor(down) + yardsToGo +
+                    absoluteYardlineNumber + score_diff,
+                  data = model_data)
+summary(yards_model)
+confint(yards_model)["playActionTRUE", ]
+```
+
+
+```{r}
+
+
+## Did any initial rusher cause pressure on the play?
+pressure_stats <- player_play %>%
+  filter(wasInitialPassRusher == 1) %>%
+  group_by(gameId, playId) %>%
+  summarize(any_pressure = max(causedPressure, na.rm = TRUE), .groups = "drop")
+
+model_data <- model_data %>%
+  left_join(pressure_stats, by = c("gameId", "playId")) %>%
+  mutate(sack = ifelse(passResult == "S", 1, 0))
+
+## Pressure rate by play type
+model_data %>%
+  group_by(playAction) %>%
+  summarize(n = n(),
+            pressure_rate = mean(any_pressure, na.rm = TRUE),
+            sack_rate = mean(sack, na.rm = TRUE))
+```
+
+
+
+```{r}
+
+## Does play-action lower the chance of pressure, with the same controls?
+pressure_model <- glm(any_pressure ~ playAction + factor(down) + yardsToGo +
+                        absoluteYardlineNumber + score_diff,
+                      data = model_data, family = binomial)
+summary(pressure_model)
+
+```
+
+
+```{r}
+## Does slower get-off go with less pressure?
+getoff_pressure <- glm(any_pressure ~ avg_getoff + playAction + factor(down) + yardsToGo +
+                         absoluteYardlineNumber + score_diff,
+                       data = model_data, family = binomial)
+summary(getoff_pressure)
+```
+
+
+```{r}
+model_data <- model_data %>%
+  mutate(play_type = factor(ifelse(playAction, "Play-Action", "Standard Dropback"),
+                            levels = c("Standard Dropback", "Play-Action")))
+
+pa_colors <- c("Standard Dropback" = "#999999", "Play-Action" = "#0072B2")
+
+theme_paper <- theme_minimal(base_size = 12, base_family = "serif") +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+```
+
+
+```{r}
+ggplot(model_data, aes(x = play_type, y = avg_getoff, fill = play_type)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  scale_fill_manual(values = pa_colors, guide = "none") +
+  labs(title = "Pass Rushers Get Off the Line Slower on Play-Action",
+       x = NULL,
+       y = "Average get-off time (seconds)") +
+  theme_paper
+```
+
+
+```{r}
+model_data %>%
+  filter(!is.na(any_pressure)) %>%
+  group_by(down, play_type) %>%
+  summarize(pressure_rate = mean(any_pressure), .groups = "drop") %>%
+  ggplot(aes(x = factor(down), y = pressure_rate, fill = play_type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = pa_colors) +
+  labs(title = "Pressure Rates Increase on Later Downs",
+       x = "Down",
+       y = "Share of dropbacks with pressure",
+       fill = NULL) +
+  theme_paper
+```
+
+
+```{r}
+
+model_data %>%
+  filter(!is.na(avg_getoff), !is.na(any_pressure)) %>%
+  mutate(getoff_group = ntile(avg_getoff, 5)) %>%
+  group_by(getoff_group) %>%
+  summarize(mean_getoff = mean(avg_getoff),
+            pressure_rate = mean(any_pressure), .groups = "drop") %>%
+  ggplot(aes(x = mean_getoff, y = pressure_rate)) +
+  geom_line(color = "#0072B2") +
+  geom_point(color = "#0072B2", size = 3,) +
+  labs(title = "Slower Get-Off Goes With Less Pressure",
+       x = "Average get-off time in group (seconds)",
+       y = "Share of dropbacks with pressure") +
+  theme_paper
+
+```
+
+
+```{r}
+
+## Play-action effect on get-off, overall and by down
+get_effect <- function(data, label, formula) {
+  fit <- lm(formula, data = data)
+  ci <- confint(fit)["playActionTRUE", ]
+  data.frame(group = label,
+             estimate = coef(fit)["playActionTRUE"],
+             lower = ci[1],
+             upper = ci[2])
+}
+
+by_down_formula <- avg_getoff ~ playAction + yardsToGo + absoluteYardlineNumber + score_diff
+overall_formula <- avg_getoff ~ playAction + factor(down) + yardsToGo + absoluteYardlineNumber + score_diff
+
+effects <- rbind(
+  get_effect(model_data, "All plays", overall_formula),
+  get_effect(filter(model_data, down == 1), "1st down", by_down_formula),
+  get_effect(filter(model_data, down == 2), "2nd down", by_down_formula),
+  get_effect(filter(model_data, down == 3), "3rd down", by_down_formula)
+)
+rownames(effects) <- NULL
+
+effects$group <- factor(effects$group,
+                        levels = c("3rd down", "2nd down", "1st down", "All plays"))
+
+ggplot(effects, aes(x = estimate, y = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = lower, xmax = upper),
+                  color = "#0072B2", size = 0.8) +
+  geom_text(aes(label = paste0(round(estimate, 2), " sec")),
+            vjust = -1.2, family = "serif") +
+  labs(title = "Play-Action Slows the Pass Rush on Every Down",
+       x = "Slower get-off on play-action (seconds, 95% CI)",
+       y = NULL) +
+  theme_paper
+
+```
+
+
+```{r}
+
+# 1. Create team_getoff (notice no '+' at the end of this statement)
+team_getoff <- model_data %>%
+  filter(!is.na(avg_getoff)) %>%
+  group_by(defensiveTeam, play_type) %>%
+  summarize(mean_getoff = mean(avg_getoff), .groups = "drop") %>%
+  pivot_wider(names_from = play_type, values_from = mean_getoff) %>%
+  mutate(gap = `Play-Action` - `Standard Dropback`) %>%
+  arrange(gap) %>%
+  mutate(defensiveTeam = factor(defensiveTeam, levels = defensiveTeam))
+
+# 2. Plot team_getoff
+ggplot(team_getoff, aes(y = defensiveTeam)) +
+  geom_segment(aes(x = `Standard Dropback`, xend = `Play-Action`, yend = defensiveTeam),
+               color = "#999999") +
+  geom_point(aes(x = `Standard Dropback`, color = "Standard Dropback", shape = "Standard Dropback"),
+             size = 2.5) +
+  geom_point(aes(x = `Play-Action`, color = "Play-Action", shape = "Play-Action"),
+             size = 2.5) +
+  scale_color_manual(values = pa_colors, breaks = c("Standard Dropback", "Play-Action")) +
+  scale_shape_manual(values = c("Standard Dropback" = 15, "Play-Action" = 16),
+                     breaks = c("Standard Dropback", "Play-Action")) +
+  scale_y_discrete(expand = expansion(add = 1.2)) +
+  labs(
+    title = "Every Defense Gets Off the Line Slower on Play-Action",
+    x = "Average get-off time (seconds)",
+    y = NULL,
+    color = NULL, 
+    shape = NULL
+  ) +
+  theme_paper +
+  theme(axis.text.y = element_text(size = 8))
+
+
+```
+
+
+
+
+```{r}
+
+## Do some matching
+
+## Put the matching variables into groups
+match_data <- model_data %>%
+  mutate(dist_group = cut(yardsToGo, breaks = c(0, 3, 6, 10),
+                          labels = c("1-3", "4-6", "7-10")),
+         field_group = ntile(absoluteYardlineNumber, 4),
+         score_group = cut(score_diff, breaks = c(-Inf, -9, -1, 8, Inf),
+                           labels = c("Down 9+", "Down 1-8", "Tied or up 1-8", "Up 9+")))
+
+
+## Keep only groups that have both play-action and standard dropbacks
+cells <- match_data %>%
+  group_by(down, dist_group, field_group, score_group) %>%
+  summarize(n_pa = sum(playAction), n_std = sum(!playAction), .groups = "drop") %>%
+  filter(n_pa > 0, n_std > 0)
+
+matched <- match_data %>%
+  inner_join(cells, by = c("down", "dist_group", "field_group", "score_group")) %>%
+  mutate(weight = ifelse(playAction, 1, n_pa / n_std))
+
+## How many plays did we keep?
+table(match_data$playAction)
+table(matched$playAction)
+
+```
+
+
+```{r}
+## Balance check: are the two play types more similar after matching?
+match_data %>%
+  group_by(playAction) %>%
+  summarize(yardsToGo = mean(yardsToGo),
+            field_pos = mean(absoluteYardlineNumber),
+            score_diff = mean(score_diff),
+            first_down = mean(down == 1))
+
+matched %>%
+  group_by(playAction) %>%
+  summarize(yardsToGo = weighted.mean(yardsToGo, weight),
+            field_pos = weighted.mean(absoluteYardlineNumber, weight),
+            score_diff = weighted.mean(score_diff, weight),
+            first_down = weighted.mean(down == 1, weight))
+```
+
+```{r}
+## Effects on the matched plays
+getoff_matched <- lm(avg_getoff ~ playAction + factor(down) + yardsToGo +
+                       absoluteYardlineNumber + score_diff,
+                     data = matched, weights = weight)
+summary(getoff_matched)
+
+epa_matched <- lm(expectedPointsAdded ~ playAction + factor(down) + yardsToGo +
+                    absoluteYardlineNumber + score_diff,
+                  data = matched, weights = weight)
+summary(epa_matched)
+confint(epa_matched)["playActionTRUE", ]
+```
+
+```{r}
+
+##install.packages(c("lmtest", "car", "sandwich"))
+
+
+library(lmtest)
+library(car)
+library(sandwich)
+
+## 1. Diagnostics: constant variance (Breusch-Pagan) and multicollinearity (VIF)
+bptest(getoff_model)
+bptest(epa_model)
+vif(getoff_model)
+vif(epa_model)
+
+## Residual plots
+par(mfrow = c(2, 2))
+plot(getoff_model)
+par(mfrow = c(2, 2))
+plot(epa_model)
+par(mfrow = c(1, 1))
+
+## 2. Robust standard errors (use these if Breusch-Pagan flags uneven variance)
+coeftest(getoff_model, vcov = vcovHC(getoff_model, type = "HC3"))
+coeftest(epa_model, vcov = vcovHC(epa_model, type = "HC3"))
+
+## 3. Matched yards model, so the table below is complete
+yards_matched <- lm(yardsGained ~ playAction + factor(down) + yardsToGo +
+                      absoluteYardlineNumber + score_diff,
+                    data = matched, weights = weight)
+
+## 4. Results table: play-action effect, unmatched vs. matched
+get_b1 <- function(model, label, method) {
+  est <- summary(model)$coefficients["playActionTRUE", "Estimate"]
+  ci <- confint(model)["playActionTRUE", ]
+  data.frame(Outcome = label, Method = method,
+             Estimate = round(est, 3),
+             Lower = round(ci[1], 3),
+             Upper = round(ci[2], 3))
+}
+
+results_table <- rbind(
+  get_b1(getoff_model, "Get-off time (seconds)", "Regression"),
+  get_b1(getoff_matched, "Get-off time (seconds)", "Matched"),
+  get_b1(epa_model, "EPA per dropback", "Regression"),
+  get_b1(epa_matched, "EPA per dropback", "Matched"),
+  get_b1(yards_model, "Yards per dropback", "Regression"),
+  get_b1(yards_matched, "Yards per dropback", "Matched")
+)
+rownames(results_table) <- NULL
+results_table
+
+## 5. Pressure results as odds ratios
+or_table <- function(model) {
+  out <- exp(cbind(OR = coef(model), confint.default(model)))
+  round(out, 3)
+}
+or_table(pressure_model)
+or_table(getoff_pressure)
+
+## Effect of a 0.1 second slower get-off on the odds of pressure
+exp(coef(getoff_pressure)["avg_getoff"] * 0.1)
+
+
+## 6. EPA visual: matched estimate vs. regression estimate, with intervals
+epa_plot_data <- results_table %>%
+  filter(Outcome == "EPA per dropback")
+
+ggplot(epa_plot_data, aes(x = Estimate, y = Method)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = Lower, xmax = Upper), color = "#0072B2", size = 0.8) +
+  labs(title = "Play-Action Shows a Small EPA Gain Under Both Methods",
+       x = "Difference in EPA per dropback, play-action minus standard (95% CI)",
+       y = NULL) +
+  theme_paper
+
+```
+
+
+
+```{r}
+dir.create("figures", showWarnings = FALSE)
+
+## Figure 1: get-off boxplot
+## Caption title: Pass Rushers Get Off the Line Slower on Play-Action
+p1 <- ggplot(model_data, aes(x = play_type, y = avg_getoff, fill = play_type)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  scale_fill_manual(values = pa_colors, guide = "none") +
+  labs(x = NULL, y = "Average get-off time (seconds)") +
+  theme_paper
+
+## Figure 2: get-off vs. pressure
+## Caption title: Slower Get-Off Goes With Less Pressure
+p2 <- model_data %>%
+  filter(!is.na(avg_getoff), !is.na(any_pressure)) %>%
+  mutate(getoff_group = ntile(avg_getoff, 5)) %>%
+  group_by(getoff_group) %>%
+  summarize(mean_getoff = mean(avg_getoff),
+            pressure_rate = mean(any_pressure), .groups = "drop") %>%
+  ggplot(aes(x = mean_getoff, y = pressure_rate)) +
+  geom_line(color = "#0072B2") +
+  geom_point(color = "#0072B2", size = 3) +
+  expand_limits(y = 0) +
+  labs(x = "Average get-off time in group (seconds)",
+       y = "Share of dropbacks with pressure") +
+  theme_paper
+
+## Figure 3: EPA effect, regression vs. matched
+## Caption title: Play-Action Shows a Small EPA Gain Under Both Methods
+p3 <- ggplot(epa_plot_data, aes(x = Estimate, y = Method)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = Lower, xmax = Upper), color = "#0072B2", size = 0.8) +
+  labs(x = "Difference in EPA per dropback, play-action minus standard (95% CI)",
+       y = NULL) +
+  theme_paper
+
+## Optional Figure 4: pressure by down
+## Caption title: Play-Action Draws More Pressure on 1st and 2nd Down but Less on 3rd Down
+p4 <- model_data %>%
+  filter(!is.na(any_pressure)) %>%
+  group_by(down, play_type) %>%
+  summarize(pressure_rate = mean(any_pressure), .groups = "drop") %>%
+  ggplot(aes(x = factor(down), y = pressure_rate, fill = play_type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = pa_colors) +
+  labs(x = "Down", y = "Share of dropbacks with pressure", fill = NULL) +
+  theme_paper
+
+ggsave("figures/fig1_getoff_boxplot.png", p1, width = 6.5, height = 4, dpi = 300)
+ggsave("figures/fig2_getoff_pressure.png", p2, width = 6.5, height = 4, dpi = 300)
+ggsave("figures/fig3_epa_effect.png", p3, width = 6.5, height = 3.5, dpi = 300)
+ggsave("figures/fig4_pressure_by_down.png", p4, width = 6.5, height = 4, dpi = 300)
+
+p1
+p2
+p3
+p4
+```
+
+
+
+```{r}
+## Play-action effect on EPA, matched plays, overall and by down group
+get_effect_w <- function(data, label, formula) {
+  fit <- lm(formula, data = data, weights = weight)
+  ci <- confint(fit)["playActionTRUE", ]
+  data.frame(group = label,
+             estimate = coef(fit)["playActionTRUE"],
+             lower = ci[1],
+             upper = ci[2])
+}
+
+f_all <- expectedPointsAdded ~ playAction + factor(down) + yardsToGo +
+  absoluteYardlineNumber + score_diff
+f_one <- expectedPointsAdded ~ playAction + yardsToGo +
+  absoluteYardlineNumber + score_diff
+
+epa_effects <- rbind(
+  get_effect_w(matched, "All plays", f_all),
+  get_effect_w(filter(matched, down == 1), "1st down", f_one),
+  get_effect_w(filter(matched, down >= 2), "2nd and 3rd down", f_all)
+)
+rownames(epa_effects) <- NULL
+
+## Number of play-action plays in each group, for the labels
+n_pa <- c("All plays" = sum(matched$playAction),
+          "1st down" = sum(matched$playAction & matched$down == 1),
+          "2nd and 3rd down" = sum(matched$playAction & matched$down >= 2))
+
+epa_effects <- epa_effects %>%
+  mutate(label = paste0(group, "\n(", format(n_pa[group], big.mark = ","), " play-action plays)"),
+         label = factor(label, levels = label))
+
+epa_effects
+
+## Fixed plot: labels above the error bars
+p_epa3 <- ggplot(epa_effects, aes(x = label, y = estimate)) +
+  geom_col(fill = "#0072B2", width = 0.55) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15,
+                color = "gray30", linewidth = 0.5) +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(y = upper, label = round(estimate, 2)),
+            vjust = -0.6, family = "serif") +
+  labs(x = NULL,
+       y = "EPA gained per dropback from play-action (95% CI)") +
+  theme_paper
+
+p_epa3
+ggsave("figures/fig2_epa_effect.png", p_epa3, width = 6.5, height = 4, dpi = 300)
+
+## Check 1: how often do offenses pass, by down and distance? (all plays, runs included)
+plays %>%
+  filter(down %in% c(1, 2, 3), qbKneel == 0, qbSpike == FALSE) %>%
+  mutate(dist_group = cut(yardsToGo, breaks = c(0, 3, 6, 10, Inf),
+                          labels = c("1-3", "4-6", "7-10", "11+"))) %>%
+  group_by(down, dist_group) %>%
+  summarize(plays = n(), pass_rate = round(mean(isDropback == TRUE), 3), .groups = "drop")
+
+## Check 2: how many play-action plays are in each down and distance group?
+matched %>%
+  filter(playAction) %>%
+  count(down, dist_group)
+
+## Check 3: play-action effect on EPA by distance group (matched plays)
+dist_effects <- bind_rows(lapply(c("1-3", "4-6", "7-10"), function(g) {
+  d <- filter(matched, dist_group == g)
+  fit <- lm(expectedPointsAdded ~ playAction + factor(down) + absoluteYardlineNumber + score_diff,
+            data = d, weights = weight)
+  ci <- confint(fit)["playActionTRUE", ]
+  data.frame(distance = g, n_playaction = sum(d$playAction),
+             estimate = round(coef(fit)["playActionTRUE"], 3),
+             lower = round(ci[1], 3), upper = round(ci[2], 3))
+}))
+dist_effects
+```
+
+
+```{r}
+## The two groups, from the matched plays
+first_down <- filter(matched, down == 1)
+third_short <- filter(matched, down == 3, yardsToGo <= 3)
+
+## How many plays in each? (FALSE = standard, TRUE = play-action)
+table(first_down$playAction)
+table(third_short$playAction)
+
+## Play-action effect on EPA in each group
+f_group <- expectedPointsAdded ~ playAction + yardsToGo + absoluteYardlineNumber + score_diff
+
+get_eff <- function(data, label) {
+  fit <- lm(f_group, data = data, weights = weight)
+  ci <- confint(fit)["playActionTRUE", ]
+  data.frame(group = label,
+             n_pa = sum(data$playAction),
+             estimate = coef(fit)["playActionTRUE"],
+             lower = ci[1],
+             upper = ci[2])
+}
+
+short_effects <- rbind(
+  get_eff(first_down, "1st down"),
+  get_eff(third_short, "3rd and short (3 yards or less)")
+)
+rownames(short_effects) <- NULL
+
+short_effects <- short_effects %>%
+  mutate(label = paste0(group, "\n(", format(n_pa, big.mark = ","), " play-action plays)"),
+         label = factor(label, levels = label))
+
+short_effects
+
+## Plot
+p_short <- ggplot(short_effects, aes(x = label, y = estimate)) +
+  geom_col(fill = "#0072B2", width = 0.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15,
+                color = "gray30", linewidth = 0.5) +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(y = upper, label = round(estimate, 2)),
+            vjust = -0.6, family = "serif") +
+  labs(x = NULL,
+       y = "EPA gained per dropback from play-action (95% CI)") +
+  theme_paper
+
+p_short
+ggsave("figures/fig2_epa_first_vs_third_short.png", p_short, width = 6.5, height = 4, dpi = 300)
+
+## Formal check: is the play-action effect different in the two groups?
+both <- bind_rows(mutate(first_down, grp = "first"),
+                  mutate(third_short, grp = "third_short"))
+
+compare_model <- lm(expectedPointsAdded ~ playAction * grp + yardsToGo +
+                      absoluteYardlineNumber + score_diff,
+                    data = both, weights = weight)
+summary(compare_model)
+confint(compare_model)["playActionTRUE:grpthird_short", ]
+```
+
+
+```{r}
+## 1. Does pressure cost EPA? (matched plays, weighted)
+pressure_epa_model <- lm(expectedPointsAdded ~ any_pressure + playAction + factor(down) +
+                           yardsToGo + absoluteYardlineNumber + score_diff,
+                         data = matched, weights = weight)
+summary(pressure_epa_model)
+confint(pressure_epa_model)["any_pressure", ]
+
+## 2. Mediation check: does play-action's EPA effect shrink once pressure is in the model?
+## Compare playActionTRUE here to 0.111 in epa_matched
+summary(pressure_epa_model)$coefficients["playActionTRUE", ]
+confint(pressure_epa_model)["playActionTRUE", ]
+
+## 3. Average EPA by pressure and play type (weighted)
+wmean_se <- function(x, w) {
+  ok <- !is.na(x)
+  x <- x[ok]
+  w <- w[ok]
+  m <- weighted.mean(x, w)
+  se <- sqrt(sum(w^2 * (x - m)^2)) / sum(w)
+  c(mean = m, se = se)
+}
+
+epa_pressure <- matched %>%
+  filter(!is.na(any_pressure)) %>%
+  mutate(pressure_label = ifelse(any_pressure == 1, "Pressured", "Not pressured")) %>%
+  group_by(pressure_label, play_type) %>%
+  summarize(plays = n(),
+            mean_epa = wmean_se(expectedPointsAdded, weight)["mean"],
+            se = wmean_se(expectedPointsAdded, weight)["se"],
+            .groups = "drop") %>%
+  mutate(pressure_label = factor(pressure_label, levels = c("Not pressured", "Pressured")))
+
+epa_pressure
+
+p_pressure_epa <- ggplot(epa_pressure, aes(x = pressure_label, y = mean_epa, fill = play_type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = mean_epa - 1.96 * se, ymax = mean_epa + 1.96 * se),
+                position = position_dodge(width = 0.8), width = 0.2,
+                color = "gray30", linewidth = 0.5) +
+  geom_hline(yintercept = 0) +
+  scale_fill_manual(values = pa_colors) +
+  labs(x = NULL,
+       y = "Average EPA per dropback (95% CI)",
+       fill = NULL) +
+  theme_paper
+
+p_pressure_epa
+ggsave("figures/fig3_pressure_epa.png", p_pressure_epa, width = 6.5, height = 4, dpi = 300)
+
+## 4. Share of dropbacks pressured by play type (matched), for context
+matched %>%
+  filter(!is.na(any_pressure)) %>%
+  group_by(play_type) %>%
+  summarize(pressure_rate = weighted.mean(any_pressure, weight))
+```
+
+
+```{r}
+matched_p <- matched %>% filter(!is.na(any_pressure))
+
+get_eff_p <- function(data, label) {
+  fit <- lm(expectedPointsAdded ~ playAction + factor(down) + yardsToGo +
+              absoluteYardlineNumber + score_diff,
+            data = data, weights = weight)
+  ci <- confint(fit)["playActionTRUE", ]
+  data.frame(group = label,
+             n_pa = sum(data$playAction),
+             estimate = coef(fit)["playActionTRUE"],
+             lower = ci[1],
+             upper = ci[2])
+}
+
+pressure_effects <- rbind(
+  get_eff_p(filter(matched_p, any_pressure == 0), "Not pressured"),
+  get_eff_p(filter(matched_p, any_pressure == 1), "Pressured")
+)
+rownames(pressure_effects) <- NULL
+
+pressure_effects <- pressure_effects %>%
+  mutate(label = paste0(group, "\n(", format(n_pa, big.mark = ","), " play-action plays)"),
+         label = factor(label, levels = label))
+
+pressure_effects
+
+p_press_eff <- ggplot(pressure_effects, aes(x = label, y = estimate)) +
+  geom_col(fill = "#0072B2", width = 0.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15,
+                color = "gray30", linewidth = 0.5) +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(y = pmax(upper, 0), label = round(estimate, 2)),
+            vjust = -0.6, family = "serif") +
+  labs(x = NULL,
+       y = "EPA gained per dropback from play-action (95% CI)") +
+  theme_paper
+
+p_press_eff
+ggsave("figures/fig3_epa_by_pressure.png", p_press_eff, width = 6.5, height = 4, dpi = 300)
+
+## Does play-action's effect differ when pressured vs. not?
+inter_pressure <- lm(expectedPointsAdded ~ playAction * any_pressure + factor(down) +
+                       yardsToGo + absoluteYardlineNumber + score_diff,
+                     data = matched_p, weights = weight)
+summary(inter_pressure)
+confint(inter_pressure)["playActionTRUE:any_pressure", ]
+```
+
